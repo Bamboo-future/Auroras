@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash
 import os
 from werkzeug.utils import secure_filename
 from docx import Document
@@ -9,22 +9,22 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-import networkx as nx
 import io
 import base64
 import re
 import numpy as np
 from datetime import datetime
-import random
+import networkx as nx
+import math
+import tempfile
 
 app = Flask(__name__)
-app.secret_key = 'novel_analysis_secret_key_2024'
+app.secret_key = os.environ.get('SECRET_KEY', 'novel_analysis_secret_key_2024_commercial')
 
-# 配置上传文件夹
-UPLOAD_FOLDER = 'uploads'
+# 配置
+UPLOAD_FOLDER = 'tmp_uploads'  # 使用临时目录
 ALLOWED_EXTENSIONS = {'docx'}
-MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
+MAX_FILE_SIZE = 16 * 1024 * 1024
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
@@ -34,51 +34,27 @@ if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 # 配置中文字体
-try:
-    font_paths = [
-        'C:/Windows/Fonts/simhei.ttf',
-        'C:/Windows/Fonts/simsun.ttc',
-        '/System/Library/Fonts/PingFang.ttc',
-        '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf'
-    ]
+plt.rcParams['font.family'] = ['DejaVu Sans', 'SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
 
-    chinese_font = None
-    for path in font_paths:
-        if os.path.exists(path):
-            chinese_font = fm.FontProperties(fname=path)
-            break
-
-    if chinese_font is None:
-        chinese_font = fm.FontProperties()
-        print("警告: 未找到中文字体，图表可能无法正确显示中文")
-    else:
-        plt.rcParams['font.family'] = chinese_font.get_name()
-        plt.rcParams['axes.unicode_minus'] = False
-except Exception as e:
-    print(f"字体配置错误: {e}")
-
-# 关系类型定义
-RELATIONSHIP_TYPES = {
-    '家人': ['父亲', '母亲', '儿子', '女儿', '兄弟', '姐妹', '丈夫', '妻子', '祖父', '祖母', '叔叔', '阿姨', '侄子',
-             '侄女'],
-    '朋友': ['朋友', '好友', '知己', '伙伴', '同伴', '同学', '同事'],
-    '敌对': ['敌人', '仇人', '对手', '竞争者', '对头'],
-    '师徒': ['师父', '徒弟', '老师', '学生', '师傅', '学徒'],
-    '上下级': ['上司', '下属', '领导', '部下', '主人', '仆人', '皇帝', '臣子'],
-    '爱人': ['爱人', '恋人', '情侣', '夫妻', '未婚夫', '未婚妻']
+# 关系模式识别词典
+RELATIONSHIP_PATTERNS = {
+    '父子': ['父亲', '爸爸', '爹', '老爸', '父'],
+    '母子': ['母亲', '妈妈', '娘', '老妈', '母'],
+    '夫妻': ['丈夫', '妻子', '老婆', '老公', '夫君', '夫人', '配偶'],
+    '兄弟姐妹': ['哥哥', '弟弟', '姐姐', '妹妹', '兄', '弟', '姐', '妹', '兄弟', '姐妹'],
+    '朋友': ['朋友', '好友', '伙伴', '同伴', '哥们', '闺蜜'],
+    '师徒': ['师父', '师傅', '徒弟', '弟子', '学生', '老师'],
+    '敌人': ['敌人', '仇人', '对手', '仇敌', '对头'],
+    '上下级': ['上司', '下属', '领导', '部下', '老板', '员工']
 }
 
 
 def allowed_file(filename):
-    """检查文件扩展名是否允许"""
-    return '.' in filename and \
-        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def read_docx(file_path):
-    """
-    读取Word文档内容
-    """
     try:
         doc = Document(file_path)
         full_text = []
@@ -97,17 +73,10 @@ def read_docx(file_path):
 
 
 def is_chapter_title(text, position):
-    """
-    判断是否为章节标题
-    """
     chapter_patterns = [
         r'^第[零一二三四五六七八九十百千\d]+[章节回]',
         r'^[上下]?篇',
         r'^卷[一二三四五六七八九十]',
-        r'^引子$',
-        r'^序幕$',
-        r'^尾声$',
-        r'^后记$',
     ]
 
     for pattern in chapter_patterns:
@@ -121,14 +90,12 @@ def is_chapter_title(text, position):
 
 
 def clean_text(input_text):
-    """清理文本"""
     cleaned = re.sub(r'\s+', ' ', input_text)
     cleaned = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9\s，。！？；："\'（）《》]', '', cleaned)
     return cleaned.strip()
 
 
 def analyze_word_frequency(text, top_n=30):
-    """分析词频"""
     cleaned_text = clean_text(text)
 
     if not cleaned_text:
@@ -162,221 +129,176 @@ def analyze_word_frequency(text, top_n=30):
     return result
 
 
-def extract_characters_with_context(text, top_n=15):
-    """
-    提取人物并分析上下文关系
-    """
-    # 使用jieba进行词性标注
+def extract_characters_advanced(text, top_n=20):
     words = pseg.cut(text)
+    potential_chars = []
 
-    # 提取可能的人名
-    characters = []
     for word, flag in words:
         if flag == 'nr' and len(word) > 1:
-            characters.append(word)
-        elif flag in ['n', 'nh'] and len(word) > 1:
-            if not is_not_person_name(word):
-                characters.append(word)
+            potential_chars.append(word)
 
-    # 统计人物出现频率
-    char_freq = Counter(characters)
-    main_characters = char_freq.most_common(top_n)
+    char_stats = defaultdict(lambda: {'count': 0, 'positions': [], 'dialogues': 0})
 
-    # 分析人物关系
-    relationships = analyze_character_relationships_advanced(text, main_characters)
+    paragraphs = [p for p in text.split('\n') if p.strip()]
+    total_paragraphs = len(paragraphs)
 
-    return main_characters, relationships
+    for i, para in enumerate(paragraphs):
+        for char in potential_chars:
+            if char in para:
+                char_stats[char]['count'] += 1
+                char_stats[char]['positions'].append(i)
 
+                if '说' in para or '道' in para or '问' in para or '答' in para:
+                    char_stats[char]['dialogues'] += 1
 
-def is_not_person_name(word):
-    """判断是否不是人名"""
-    non_person_words = {
-        '时候', '地方', '东西', '事情', '问题', '工作', '公司', '学校', '国家', '城市',
-        '今天', '昨天', '明天', '时间', '朋友', '老师', '学生', '医生', '警察', '老板'
-    }
-    return word in non_person_words
-
-
-def analyze_character_relationships_advanced(text, characters):
-    """
-    高级人物关系分析
-    通过分析人物在上下文中的互动来判断关系类型
-    """
-    main_chars = [char[0] for char in characters]
-
-    # 按句子分割文本
-    sentences = re.split(r'[。！？]', text)
-
-    relationships = []
-
-    for sentence in sentences:
-        if len(sentence.strip()) < 5:  # 跳过过短的句子
+    char_scores = []
+    for char, stats in char_stats.items():
+        if stats['count'] < 2:
             continue
 
-        # 找出在当前句子中出现的人物
-        present_chars = []
-        for char in main_chars:
-            if char in sentence:
-                present_chars.append(char)
-
-        # 如果句子中有两个或更多人物，分析他们的关系
-        if len(present_chars) >= 2:
-            relationship = analyze_sentence_relationship(sentence, present_chars)
-            if relationship:
-                relationships.append(relationship)
-
-    # 合并相同的关系
-    merged_relationships = merge_relationships(relationships)
-
-    return merged_relationships
-
-
-def analyze_sentence_relationship(sentence, characters):
-    """
-    分析句子中人物关系
-    """
-    # 关系关键词模式
-    patterns = {
-        '父子': [r'(\w+)的(父亲|爸爸|爹)', r'(\w+)的(儿子|孩子|小儿)'],
-        '母女': [r'(\w+)的(母亲|妈妈|娘)', r'(\w+)的(女儿|闺女|女)'],
-        '兄弟': [r'(\w+)的(哥哥|兄长|大哥)', r'(\w+)的(弟弟|兄弟|小弟)'],
-        '姐妹': [r'(\w+)的(姐姐|大姐)', r'(\w+)的(妹妹|小妹)'],
-        '夫妻': [r'(\w+)的(妻子|老婆|夫人)', r'(\w+)的(丈夫|老公|先生)'],
-        '朋友': [r'(\w+)的(朋友|好友|伙伴)', r'(\w+)和(\w+)是(朋友|好友)'],
-        '敌人': [r'(\w+)的(敌人|仇人|对头)', r'(\w+)和(\w+)是(敌人|仇人)'],
-        '师徒': [r'(\w+)的(师父|师傅|老师)', r'(\w+)的(徒弟|学生|弟子)'],
-        '上下级': [r'(\w+)的(上司|领导|老板)', r'(\w+)的(下属|部下|员工)']
-    }
-
-    for rel_type, pattern_list in patterns.items():
-        for pattern in pattern_list:
-            matches = re.findall(pattern, sentence)
-            for match in matches:
-                # 确保匹配到的人物在characters列表中
-                for char in characters:
-                    if char in match:
-                        # 找到关系中的另一个人物
-                        for other_char in characters:
-                            if other_char != char and other_char in sentence:
-                                return {
-                                    'source': char,
-                                    'target': other_char,
-                                    'relationship': rel_type,
-                                    'sentence': sentence[:100] + '...' if len(sentence) > 100 else sentence
-                                }
-
-    # 如果没有明确的关系模式，根据上下文推断
-    return infer_relationship_from_context(sentence, characters)
-
-
-def infer_relationship_from_context(sentence, characters):
-    """
-    根据上下文推断关系
-    """
-    if len(characters) < 2:
-        return None
-
-    # 情感词分析
-    positive_words = {'帮助', '关心', '爱护', '支持', '鼓励', '赞美', '感谢', '喜欢', '爱'}
-    negative_words = {'伤害', '攻击', '批评', '讨厌', '恨', '背叛', '欺骗', '威胁'}
-
-    sentence_words = set(jieba.lcut(sentence))
-
-    if sentence_words & positive_words:
-        relationship_type = '朋友'
-    elif sentence_words & negative_words:
-        relationship_type = '敌人'
-    else:
-        relationship_type = '相识'  # 默认关系
-
-    return {
-        'source': characters[0],
-        'target': characters[1],
-        'relationship': relationship_type,
-        'sentence': sentence[:100] + '...' if len(sentence) > 100 else sentence
-    }
-
-
-def merge_relationships(relationships):
-    """
-    合并相同的人物关系
-    """
-    merged = {}
-
-    for rel in relationships:
-        if rel is None:
-            continue
-
-        key = (rel['source'], rel['target'])
-        reverse_key = (rel['target'], rel['source'])
-
-        # 检查是否已经存在相同或相反的关系
-        if key in merged:
-            # 如果关系类型不同，选择更具体的关系
-            if merged[key]['relationship'] == '相识' and rel['relationship'] != '相识':
-                merged[key] = rel
-        elif reverse_key in merged:
-            # 处理相反方向的关系
-            existing_rel = merged[reverse_key]
-            # 确保关系类型一致
-            if existing_rel['relationship'] == rel['relationship']:
-                merged[reverse_key]['sentence'] += f" | {rel['sentence']}"
+        positions = stats['positions']
+        if len(positions) > 1:
+            position_variance = np.var(positions)
+            position_score = 1 / (1 + position_variance / 1000)
         else:
-            merged[key] = rel
+            position_score = 0.5
 
-    return list(merged.values())
+        dialogue_score = stats['dialogues'] / max(1, stats['count'])
+        total_score = stats['count'] * position_score * (1 + dialogue_score)
+
+        char_scores.append((char, total_score, stats['count']))
+
+    char_scores.sort(key=lambda x: x[1], reverse=True)
+
+    if char_scores:
+        main_count = min(3, len(char_scores))
+        main_chars = [(char, score, count) for char, score, count in char_scores[:main_count]]
+        supporting_chars = [(char, score, count) for char, score, count in char_scores[main_count:top_n]]
+
+        return {
+            'main_characters': main_chars,
+            'supporting_characters': supporting_chars
+        }
+
+    return {'main_characters': [], 'supporting_characters': []}
 
 
-def identify_main_character(characters, relationships):
-    """
-    识别主角
-    基于出现频率和关系网络中心性
-    """
-    if not characters:
-        return None
+def analyze_character_relationships_advanced(text, characters_data):
+    main_chars = [char[0] for char in characters_data['main_characters']]
+    all_chars = main_chars + [char[0] for char in characters_data['supporting_characters']]
 
-    # 构建关系图
     G = nx.Graph()
 
-    # 添加节点（人物）
-    for char, freq in characters:
-        G.add_node(char, frequency=freq)
+    for char in all_chars:
+        G.add_node(char, type='main' if char in main_chars else 'supporting')
 
-    # 添加边（关系）
-    for rel in relationships:
-        G.add_edge(rel['source'], rel['target'], relationship=rel['relationship'])
+    relationships = []
+    paragraphs = [p for p in text.split('\n') if p.strip()]
 
-    # 计算度中心性（与其他节点的连接数）
-    if G.number_of_nodes() > 0:
-        degree_centrality = nx.degree_centrality(G)
+    for para in paragraphs:
+        present_chars = []
+        for char in all_chars:
+            if char in para:
+                present_chars.append(char)
 
-        # 结合频率和中心性选择主角
-        best_score = -1
-        main_char = None
+        for i in range(len(present_chars)):
+            for j in range(i + 1, len(present_chars)):
+                char1, char2 = present_chars[i], present_chars[j]
+                relation_type = analyze_relationship_type(para, char1, char2)
 
-        for char, freq in characters:
-            centrality = degree_centrality.get(char, 0)
-            score = freq * (1 + centrality * 10)  # 频率和中心性的加权
-            if score > best_score:
-                best_score = score
-                main_char = char
+                if relation_type:
+                    if G.has_edge(char1, char2):
+                        G[char1][char2]['weight'] += 1
+                        G[char1][char2]['types'].add(relation_type)
+                    else:
+                        G.add_edge(char1, char2, weight=1, types={relation_type})
 
-        return main_char
+    relationship_data = []
+    for edge in G.edges(data=True):
+        char1, char2, data = edge
+        weight = data['weight']
+        types = list(data['types'])
+        main_type = types[0] if types else '相关'
 
-    # 如果没有关系数据，返回出现频率最高的人物
-    return characters[0][0]
+        relationship_data.append({
+            'source': char1,
+            'target': char2,
+            'type': main_type,
+            'strength': weight
+        })
+
+    relationship_chart = generate_relationship_chart(G, characters_data)
+
+    return relationship_data, relationship_chart
 
 
-def analyze_plot_development_advanced(text, chapter_positions, main_character):
-    """
-    高级情节发展分析
-    """
-    # 如果没有检测到章节，将文本分为5个等分
+def analyze_relationship_type(paragraph, char1, char2):
+    for relation_type, keywords in RELATIONSHIP_PATTERNS.items():
+        for keyword in keywords:
+            if keyword in paragraph:
+                char1_pos = paragraph.find(char1)
+                char2_pos = paragraph.find(char2)
+                keyword_pos = paragraph.find(keyword)
+
+                if char1_pos != -1 and char2_pos != -1 and keyword_pos != -1:
+                    min_pos = min(char1_pos, char2_pos)
+                    max_pos = max(char1_pos, char2_pos)
+
+                    if min_pos <= keyword_pos <= max_pos:
+                        return relation_type
+
+                    if abs(keyword_pos - char1_pos) < 20 or abs(keyword_pos - char2_pos) < 20:
+                        return relation_type
+
+    return None
+
+
+def generate_relationship_chart(G, characters_data):
+    if len(G.nodes()) == 0:
+        return None
+
+    plt.figure(figsize=(12, 8))
+
+    pos = nx.spring_layout(G, k=2, iterations=30)
+
+    for edge in G.edges(data=True):
+        source, target, data = edge
+        weight = data['weight']
+        edge_width = max(1, min(3, weight / 2))
+
+        nx.draw_networkx_edges(G, pos, edgelist=[(source, target)],
+                               width=edge_width, alpha=0.7, edge_color='gray')
+
+    main_chars = [char[0] for char in characters_data['main_characters']]
+
+    node_colors = []
+    for node in G.nodes():
+        if node in main_chars:
+            node_colors.append('#ff6b6b')
+        else:
+            node_colors.append('#4ecdc4')
+
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=800, alpha=0.9)
+    nx.draw_networkx_labels(G, pos, font_size=8, font_family='SimHei')
+
+    plt.title("人物关系网络图", fontsize=14, pad=20)
+    plt.axis('off')
+    plt.tight_layout()
+
+    img = io.BytesIO()
+    plt.savefig(img, format='png', dpi=80, bbox_inches='tight', facecolor='white')
+    img.seek(0)
+    chart_url = base64.b64encode(img.getvalue()).decode()
+    plt.close()
+
+    return f"data:image/png;base64,{chart_url}"
+
+
+def analyze_plot_development_advanced(text, chapter_positions, main_characters):
     if not chapter_positions:
-        segments = split_text_into_segments(text, 5)
+        segments = split_text_into_segments(text, 4)
         chapter_data = [{"title": f"第{i + 1}部分", "content": seg, "position": i} for i, seg in enumerate(segments)]
     else:
-        # 根据章节位置分割文本
         chapter_data = []
         for i, (title, pos) in enumerate(chapter_positions):
             if i < len(chapter_positions) - 1:
@@ -391,28 +313,165 @@ def analyze_plot_development_advanced(text, chapter_positions, main_character):
                 "position": i
             })
 
-    # 分析每个章节的情节
-    for chapter in chapter_data:
+    plot_analysis = []
+    for i, chapter in enumerate(chapter_data):
         content = chapter["content"]
 
-        # 分析主角行为和心理
-        character_analysis = analyze_character_actions(content, main_character)
-        chapter.update(character_analysis)
+        plot_stage = determine_plot_stage(i, len(chapter_data))
+        character_analysis = analyze_character_activities(content, main_characters)
+        plot_function = analyze_plot_function(content, i, len(chapter_data))
 
-        # 分析情节作用
-        plot_function = analyze_plot_function(content, chapter["position"], len(chapter_data))
-        chapter["plot_function"] = plot_function
+        plot_analysis.append({
+            "title": chapter["title"],
+            "stage": plot_stage,
+            "character_analysis": character_analysis,
+            "plot_function": plot_function,
+            "emotional_intensity": calculate_emotion_score(content),
+            "key_events": extract_key_events(content, main_characters)
+        })
 
-        # 提取关键事件
-        key_events = extract_key_events(content, main_character)
-        chapter["key_events"] = key_events
-
-    return chapter_data
+    return plot_analysis
 
 
-def split_text_into_segments(text, n_segments=5):
-    """将文本分割为n个等分"""
+def determine_plot_stage(chapter_index, total_chapters):
+    if chapter_index == 0:
+        return "开端"
+    elif chapter_index == total_chapters - 1:
+        return "结局"
+    elif chapter_index < total_chapters * 0.3:
+        return "发展"
+    elif chapter_index < total_chapters * 0.7:
+        return "高潮"
+    else:
+        return "收尾"
+
+
+def analyze_character_activities(content, main_characters):
+    analysis = []
+    main_chars = [char[0] for char in main_characters]
+
+    for char in main_chars:
+        if char in content:
+            sentences = [s for s in re.split(r'[。！？]', content) if char in s]
+
+            if sentences:
+                sample_sentence = sentences[0]
+
+                activity = {
+                    "character": char,
+                    "location": extract_location(sample_sentence),
+                    "time": extract_time(sample_sentence),
+                    "action": extract_main_action(sample_sentence, char),
+                    "psychological_state": analyze_psychological_state(sample_sentence)
+                }
+                analysis.append(activity)
+
+    return analysis
+
+
+def extract_location(sentence):
+    location_keywords = ['在', '于', '到', '去', '来到', '进入']
+    for keyword in location_keywords:
+        if keyword in sentence:
+            parts = sentence.split(keyword)
+            if len(parts) > 1:
+                return parts[1][:20] + '...'
+    return "未知地点"
+
+
+def extract_time(sentence):
+    time_patterns = [
+        r'(\d+)年',
+        r'(\d+)月',
+        r'(\d+)日',
+        r'([早晚午夜清晨]+)',
+        r'(春天|夏天|秋天|冬天)'
+    ]
+
+    for pattern in time_patterns:
+        match = re.search(pattern, sentence)
+        if match:
+            return match.group()
+
+    return "未知时间"
+
+
+def extract_main_action(sentence, character):
+    action_verbs = ['说', '做', '走', '跑', '看', '听', '想', '感觉', '决定']
+
+    for verb in action_verbs:
+        if verb in sentence and character in sentence:
+            return f"{character}{verb}"
+
+    return f"{character}活动"
+
+
+def analyze_psychological_state(sentence):
+    positive_words = {'高兴', '开心', '快乐', '幸福', '满意', '兴奋', '激动'}
+    negative_words = {'悲伤', '难过', '痛苦', '伤心', '愤怒', '生气', '失望', '害怕'}
+
+    words = jieba.lcut(sentence)
+
+    positive_count = sum(1 for word in words if word in positive_words)
+    negative_count = sum(1 for word in words if word in negative_words)
+
+    if positive_count > negative_count:
+        return "积极"
+    elif negative_count > positive_count:
+        return "消极"
+    else:
+        return "中性"
+
+
+def analyze_plot_function(content, chapter_index, total_chapters):
+    functions = []
+
+    if detect_suspense_elements(content):
+        functions.append("设置悬念")
+
+    if chapter_index == 0:
+        functions.append("引入背景")
+    elif chapter_index < total_chapters * 0.3:
+        functions.append("推动发展")
+    elif chapter_index < total_chapters * 0.7:
+        functions.append("构建冲突")
+    else:
+        functions.append("收束情节")
+
+    return functions if functions else ["推进故事"]
+
+
+def detect_suspense_elements(content):
+    suspense_indicators = ['突然', '忽然', '没想到', '意外', '惊奇', '竟然', '居然']
+
+    for indicator in suspense_indicators:
+        if indicator in content:
+            return True
+
+    return False
+
+
+def extract_key_events(content, main_characters):
+    main_chars = [char[0] for char in main_characters]
+
+    events = []
+    sentences = [s.strip() for s in re.split(r'[。！？]', content) if s.strip()]
+
+    for sentence in sentences:
+        has_main_char = any(char in sentence for char in main_chars)
+        has_important_verb = any(verb in sentence for verb in ['发现', '决定', '开始', '结束', '遇见', '离开'])
+
+        if has_main_char and has_important_verb and len(sentence) > 10:
+            events.append(sentence[:50] + '...')
+
+    return events[:2]
+
+
+def split_text_into_segments(text, n_segments=4):
     paragraphs = [p for p in text.split('\n') if p.strip()]
+    if not paragraphs:
+        return [text]
+
     segment_size = max(1, len(paragraphs) // n_segments)
 
     segments = []
@@ -429,152 +488,28 @@ def split_text_into_segments(text, n_segments=5):
     return segments
 
 
-def analyze_character_actions(text, main_character):
-    """
-    分析主角行为和心理状态
-    """
-    if not main_character:
-        return {
-            "location": "未知",
-            "action": "未知",
-            "mental_state": "未知",
-            "time": "未知"
-        }
-
-    # 提取包含主角的句子
-    sentences = re.split(r'[。！？]', text)
-    character_sentences = [s for s in sentences if main_character in s]
-
-    if not character_sentences:
-        return {
-            "location": "未知",
-            "action": "未知",
-            "mental_state": "未知",
-            "time": "未知"
-        }
-
-    # 分析地点
-    location = extract_location(character_sentences)
-
-    # 分析时间
-    time_info = extract_time(character_sentences)
-
-    # 分析行为
-    action = extract_action(character_sentences, main_character)
-
-    # 分析心理状态
-    mental_state = analyze_mental_state(character_sentences)
-
-    return {
-        "location": location,
-        "action": action,
-        "mental_state": mental_state,
-        "time": time_info
+def calculate_emotion_score(text):
+    positive_words = {
+        '高兴', '快乐', '开心', '幸福', '喜悦', '愉快', '兴奋', '激动', '满意', '喜欢'
     }
 
+    negative_words = {
+        '悲伤', '难过', '痛苦', '伤心', '绝望', '失望', '愤怒', '生气', '讨厌', '恨'
+    }
 
-def extract_location(sentences):
-    """提取地点信息"""
-    location_keywords = ['在', '到', '去', '来到', '走进', '离开', '从', '向']
-    location_indicators = ['家', '学校', '公司', '房间', '街道', '城市', '山', '河', '海']
+    words = jieba.lcut(text)
+    positive_count = sum(1 for word in words if word in positive_words)
+    negative_count = sum(1 for word in words if word in negative_words)
 
-    for sentence in sentences:
-        for keyword in location_keywords:
-            if keyword in sentence:
-                # 提取关键词后面的内容作为地点
-                idx = sentence.find(keyword)
-                location_text = sentence[idx:min(idx + 20, len(sentence))]
-                return location_text
+    total_emotion_words = positive_count + negative_count
+    if total_emotion_words == 0:
+        return 0
 
-    # 如果没有明确地点，返回默认值
-    return "故事发生地"
-
-
-def extract_time(sentences):
-    """提取时间信息"""
-    time_keywords = ['今天', '明天', '昨天', '早上', '中午', '晚上', '春天', '夏天', '秋天', '冬天']
-
-    for sentence in sentences:
-        for keyword in time_keywords:
-            if keyword in sentence:
-                return keyword
-
-    return "某个时间"
-
-
-def extract_action(sentences, main_character):
-    """提取主角行为"""
-    action_verbs = ['说', '做', '走', '跑', '看', '听', '想', '感觉', '决定', '开始', '结束']
-
-    for sentence in sentences:
-        if main_character in sentence:
-            # 提取主角后面的动词作为行为
-            idx = sentence.find(main_character)
-            action_part = sentence[idx:min(idx + 15, len(sentence))]
-            return action_part
-
-    return "进行某些活动"
-
-
-def analyze_mental_state(sentences):
-    """分析心理状态"""
-    positive_words = {'高兴', '快乐', '开心', '幸福', '喜悦', '愉快', '兴奋', '激动', '满意'}
-    negative_words = {'悲伤', '难过', '痛苦', '伤心', '绝望', '失望', '愤怒', '生气', '害怕', '恐惧'}
-
-    all_words = []
-    for sentence in sentences:
-        all_words.extend(jieba.lcut(sentence))
-
-    positive_count = sum(1 for word in all_words if word in positive_words)
-    negative_count = sum(1 for word in all_words if word in negative_words)
-
-    if positive_count > negative_count:
-        return "积极"
-    elif negative_count > positive_count:
-        return "消极"
-    else:
-        return "平静"
-
-
-def analyze_plot_function(text, position, total_chapters):
-    """
-    分析情节作用
-    """
-    # 根据章节位置判断情节作用
-    if position == 0:
-        return "开端：介绍背景和人物，设置故事的基本情境"
-    elif position < total_chapters * 0.3:
-        return "发展：推动故事前进，建立冲突和人物关系"
-    elif position < total_chapters * 0.7:
-        return "高潮：故事的关键转折点，冲突达到顶峰"
-    elif position == total_chapters - 1:
-        return "结局：解决冲突，完成故事弧线"
-    else:
-        return "过渡：连接不同情节部分，维持故事节奏"
-
-
-def extract_key_events(text, main_character):
-    """
-    提取关键事件
-    """
-    sentences = re.split(r'[。！？]', text)
-    key_events = []
-
-    # 关键事件指示词
-    event_indicators = ['突然', '意外', '决定', '发现', '遇见', '离开', '开始', '结束', '改变']
-
-    for sentence in sentences:
-        if main_character and main_character in sentence:
-            for indicator in event_indicators:
-                if indicator in sentence:
-                    key_events.append(sentence.strip())
-                    break
-
-    return key_events[:3]  # 返回最多3个关键事件
+    emotion_score = (positive_count - negative_count) / total_emotion_words
+    return round(emotion_score, 2)
 
 
 def calculate_text_stats(text):
-    """计算文本统计信息"""
     total_chars = len(text)
 
     paragraphs = [p for p in text.split('\n') if p.strip()]
@@ -597,28 +532,27 @@ def calculate_text_stats(text):
 
 
 def generate_word_freq_chart(word_freq):
-    """生成词频统计图表"""
     if not word_freq:
         return None
 
-    words = [item[0] for item in word_freq]
-    frequencies = [item[1] for item in word_freq]
+    words = [item[0] for item in word_freq[:20]]  # 只显示前20个
+    frequencies = [item[1] for item in word_freq[:20]]
 
-    plt.figure(figsize=(12, 8))
-    bars = plt.barh(words, frequencies, color='skyblue')
+    plt.figure(figsize=(10, 6))
+    bars = plt.barh(words, frequencies, color='#74b9ff')
 
     for bar, freq in zip(bars, frequencies):
         plt.text(bar.get_width() + max(frequencies) * 0.01, bar.get_y() + bar.get_height() / 2,
-                 f'{freq}', ha='left', va='center', fontsize=10)
+                 f'{freq}', ha='left', va='center', fontsize=8)
 
-    plt.xlabel('出现次数', fontsize=12)
-    plt.title('高频词汇统计 TOP 30', fontsize=14, fontweight='bold', pad=20)
+    plt.xlabel('出现次数', fontsize=10)
+    plt.title('高频词汇统计 TOP 20', fontsize=12, pad=15)
     plt.grid(axis='x', alpha=0.3)
     plt.gca().invert_yaxis()
     plt.tight_layout()
 
     img = io.BytesIO()
-    plt.savefig(img, format='png', dpi=100, bbox_inches='tight')
+    plt.savefig(img, format='png', dpi=80, bbox_inches='tight')
     img.seek(0)
     chart_url = base64.b64encode(img.getvalue()).decode()
     plt.close()
@@ -626,97 +560,37 @@ def generate_word_freq_chart(word_freq):
     return f"data:image/png;base64,{chart_url}"
 
 
-def generate_relationship_network(characters, relationships, main_character):
-    """生成人物关系网络图"""
-    if not characters or not relationships:
-        return None
-
-    # 创建图形
-    plt.figure(figsize=(14, 10))
-    G = nx.Graph()
-
-    # 添加节点
-    for char, freq in characters:
-        G.add_node(char, frequency=freq)
-
-    # 添加边
-    for rel in relationships:
-        G.add_edge(rel['source'], rel['target'], relationship=rel['relationship'])
-
-    # 设置节点位置（使用spring布局）
-    pos = nx.spring_layout(G, k=3, iterations=50)
-
-    # 绘制节点 - 主角用不同颜色
-    node_colors = []
-    for node in G.nodes():
-        if node == main_character:
-            node_colors.append('red')  # 主角红色
-        else:
-            node_colors.append('lightblue')  # 配角浅蓝色
-
-    nx.draw_networkx_nodes(G, pos, node_size=1500, node_color=node_colors, alpha=0.9)
-
-    # 绘制节点标签
-    nx.draw_networkx_labels(G, pos, font_size=10, font_family=chinese_font.get_name())
-
-    # 绘制边和关系标签
-    for rel in relationships:
-        source, target = rel['source'], rel['target']
-        if G.has_edge(source, target):
-            # 绘制边
-            nx.draw_networkx_edges(G, pos, edgelist=[(source, target)], width=2, alpha=0.7)
-
-            # 添加关系标签
-            x = (pos[source][0] + pos[target][0]) / 2
-            y = (pos[source][1] + pos[target][1]) / 2
-            plt.text(x, y, rel['relationship'], fontsize=9,
-                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
-                     horizontalalignment='center')
-
-    plt.title("人物关系网络图", fontsize=16, fontweight='bold', pad=20)
-    plt.axis('off')
-    plt.tight_layout()
-
-    img = io.BytesIO()
-    plt.savefig(img, format='png', dpi=100, bbox_inches='tight')
-    img.seek(0)
-    chart_url = base64.b64encode(img.getvalue()).decode()
-    plt.close()
-
-    return f"data:image/png;base64,{chart_url}"
-
-
-def generate_plot_chart(plot_data):
-    """生成情节发展图表"""
+def generate_plot_development_chart(plot_data):
     if not plot_data:
         return None
 
-    # 提取情感分数
-    emotions = [chapter.get("emotion_score", 0) for chapter in plot_data]
+    stages = [chapter["stage"] for chapter in plot_data]
+    emotions = [chapter["emotional_intensity"] for chapter in plot_data]
     titles = [chapter["title"] for chapter in plot_data]
 
-    # 创建图表
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(10, 5))
 
-    # 绘制情感曲线
     x = range(len(emotions))
-    plt.plot(x, emotions, marker='o', linewidth=2, markersize=8, color='steelblue')
+    plt.plot(x, emotions, marker='o', linewidth=2, markersize=6, color='#6c5ce7')
+    plt.fill_between(x, emotions, alpha=0.3, color='#a29bfe')
 
-    # 填充情感区域
-    plt.fill_between(x, emotions, alpha=0.3, color='lightblue')
+    stage_colors = {'开端': '#00b894', '发展': '#0984e3', '高潮': '#e17055', '收尾': '#fdcb6e', '结局': '#6c5ce7'}
 
-    # 设置坐标轴
-    plt.xticks(x, titles, rotation=45)
+    for i, (stage, emotion) in enumerate(zip(stages, emotions)):
+        color = stage_colors.get(stage, 'gray')
+        plt.text(i, emotion + 0.05, stage, ha='center', va='bottom',
+                 fontsize=8, color=color, fontweight='bold')
+
+    plt.xticks(x, titles, rotation=45, fontsize=8)
     plt.axhline(y=0, color='red', linestyle='--', alpha=0.7)
-
-    plt.xlabel('章节', fontsize=12)
-    plt.ylabel('情感分数', fontsize=12)
-    plt.title('情节情感发展', fontsize=14, fontweight='bold', pad=20)
+    plt.xlabel('章节', fontsize=10)
+    plt.ylabel('情感分数', fontsize=10)
+    plt.title('情节发展与情感变化', fontsize=12, pad=15)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
     img = io.BytesIO()
-    plt.savefig(img, format='png', dpi=100, bbox_inches='tight')
+    plt.savefig(img, format='png', dpi=80, bbox_inches='tight')
     img.seek(0)
     chart_url = base64.b64encode(img.getvalue()).decode()
     plt.close()
@@ -726,13 +600,11 @@ def generate_plot_chart(plot_data):
 
 @app.route('/')
 def index():
-    """首页"""
     return render_template('index.html')
 
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """处理文件上传"""
     try:
         if 'file' not in request.files:
             flash('请选择要上传的文件')
@@ -745,59 +617,56 @@ def upload_file():
             return redirect(request.url)
 
         if file and allowed_file(file.filename):
+            # 使用临时文件
             filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            temp_dir = tempfile.gettempdir()
+            file_path = os.path.join(temp_dir, filename)
             file.save(file_path)
 
-            text_content, chapter_positions = read_docx(file_path)
+            try:
+                text_content, chapter_positions = read_docx(file_path)
 
-            if not text_content.strip():
-                flash('文档内容为空，请上传包含内容的Word文档')
-                return redirect(request.url)
+                if not text_content.strip():
+                    flash('文档内容为空，请上传包含内容的Word文档')
+                    return redirect(request.url)
 
-            # 计算文本统计
-            stats = calculate_text_stats(text_content)
+                stats = calculate_text_stats(text_content)
+                word_freq = analyze_word_frequency(text_content)
+                characters_data = extract_characters_advanced(text_content)
+                relationships, relationship_chart = analyze_character_relationships_advanced(text_content,
+                                                                                             characters_data)
+                plot_development = analyze_plot_development_advanced(
+                    text_content, chapter_positions, characters_data['main_characters']
+                )
 
-            # 分析词频
-            word_freq = analyze_word_frequency(text_content)
+                word_chart = generate_word_freq_chart(word_freq)
+                plot_chart = generate_plot_development_chart(plot_development)
 
-            # 分析人物和关系
-            characters, relationships = extract_characters_with_context(text_content)
+                preview_text = text_content[:300] + '...' if len(text_content) > 300 else text_content
+                preview_percentage = min(100, int((300 / len(text_content)) * 100)) if len(text_content) > 300 else 100
 
-            # 识别主角
-            main_character = identify_main_character(characters, relationships)
+                return render_template('index.html',
+                                       text_preview=preview_text,
+                                       word_freq=word_freq,
+                                       characters_data=characters_data,
+                                       relationships=relationships,
+                                       relationship_chart=relationship_chart,
+                                       plot_development=plot_development,
+                                       word_chart=word_chart,
+                                       plot_chart=plot_chart,
+                                       filename=file.filename,
+                                       total_words=stats['total_words'],
+                                       unique_words=stats['unique_words'],
+                                       text_length=stats['total_chars'],
+                                       paragraph_count=stats['paragraph_count'],
+                                       reading_time=stats['reading_time'],
+                                       preview_percentage=preview_percentage,
+                                       analysis_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-            # 分析情节发展
-            plot_development = analyze_plot_development_advanced(text_content, chapter_positions, main_character)
-
-            # 生成图表
-            word_chart = generate_word_freq_chart(word_freq)
-            relationship_chart = generate_relationship_network(characters, relationships, main_character)
-            plot_chart = generate_plot_chart(plot_development)
-
-            # 文本预览
-            preview_text = text_content[:500] + '...' if len(text_content) > 500 else text_content
-            preview_percentage = min(100, int((500 / len(text_content)) * 100)) if len(text_content) > 500 else 100
-
-            # 返回分析结果
-            return render_template('index.html',
-                                   text_preview=preview_text,
-                                   word_freq=word_freq,
-                                   characters=characters,
-                                   relationships=relationships,
-                                   plot_development=plot_development,
-                                   main_character=main_character,
-                                   word_chart=word_chart,
-                                   relationship_chart=relationship_chart,
-                                   plot_chart=plot_chart,
-                                   filename=filename,
-                                   total_words=stats['total_words'],
-                                   unique_words=stats['unique_words'],
-                                   text_length=stats['total_chars'],
-                                   paragraph_count=stats['paragraph_count'],
-                                   reading_time=stats['reading_time'],
-                                   preview_percentage=preview_percentage,
-                                   analysis_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            finally:
+                # 清理临时文件
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
 
         else:
             flash('只支持 .docx 格式的Word文档')
@@ -810,7 +679,6 @@ def upload_file():
 
 @app.errorhandler(413)
 def too_large(error):
-    """文件过大错误处理"""
     flash('文件大小超过限制（最大16MB）')
     return redirect(request.url)
 
@@ -818,15 +686,12 @@ def too_large(error):
 if __name__ == '__main__':
     jieba.initialize()
 
-    if not os.path.exists('static'):
-        os.makedirs('static')
-    if not os.path.exists('templates'):
-        os.makedirs('templates')
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
 
     print("=" * 50)
     print("小说内容分析系统启动成功！")
-    print("功能：词频分析、人物关系网络、情节发展分析")
-    print("访问地址: http://localhost:5000")
+    print(f"访问地址: http://localhost:{port}")
     print("=" * 50)
 
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=debug, host='0.0.0.0', port=port)
